@@ -10,34 +10,66 @@ const agent = new Agent({
     'You are an AI image generation agent that creates images using the FLUX.1-schnell model. You help users generate beautiful, detailed images based on their descriptions.'
 })
 
-// Add image generation capability
+// Add image generation capability with rate limiting
 agent.addCapability({
   name: 'generateImage',
   description: 'Generates an image based on a text prompt using FLUX.1-schnell model',
   schema: z.object({
     prompt: z.string().describe('Detailed description of the image to generate'),
-    workspaceId: z.number().describe('Workspace ID to upload the image to'),
     filename: z.string().optional().default('generated_image.png')
   }),
-  async run({ args }) {
+  async run({ args, action }) {
     try {
-      // Query the Hugging Face API
-      const response = await fetch(
-        'https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell',
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.HF_ACCESS_TOKEN}`,
-            'Content-Type': 'application/json'
-          },
-          method: 'POST',
-          body: JSON.stringify({
-            inputs: args.prompt
-          })
-        }
-      )
+      if (!action) {
+        throw new Error('No action context available')
+      }
 
-      if (!response.ok) {
-        throw new Error(`API error: ${response.status} - ${await response.text()}`)
+      // Add delay between requests to handle rate limiting
+      const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+      
+      let attempts = 0
+      const maxAttempts = 3
+      let response
+
+      while (attempts < maxAttempts) {
+        try {
+          // Query the Hugging Face API
+          response = await fetch(
+            'https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell',
+            {
+              headers: {
+                Authorization: `Bearer ${process.env.HF_ACCESS_TOKEN}`,
+                'Content-Type': 'application/json'
+              },
+              method: 'POST',
+              body: JSON.stringify({
+                inputs: args.prompt
+              })
+            }
+          )
+
+          if (response.status === 429) {
+            // Rate limited - wait and retry
+            console.log('Rate limited, waiting 65 seconds before retry...')
+            await delay(65000) // Wait 65 seconds
+            attempts++
+            continue
+          }
+
+          if (!response.ok) {
+            throw new Error(`API error: ${response.status} - ${await response.text()}`)
+          }
+
+          break // Success - exit loop
+        } catch (error) {
+          if (attempts === maxAttempts - 1) throw error
+          attempts++
+          await delay(5000) // Wait 5 seconds between retries
+        }
+      }
+
+      if (!response) {
+        throw new Error('Failed to get response after max attempts')
       }
 
       // Get the image data
@@ -48,25 +80,21 @@ agent.addCapability({
       // Save locally first
       // fs.writeFileSync(args.filename, imageBuffer)
 
-      if (args.workspaceId) {
-        try {
-          console.log('Attempting to upload file to workspace:', args.workspaceId)
-          // Upload to workspace
-          await agent.uploadFile({
-            workspaceId: args.workspaceId,
-            path: args.filename,
-            file: imageBuffer,
-            skipSummarizer: true
-          })
-          console.log('File upload successful')
-          return `Image generated and saved as ${args.filename} (workspace ${args.workspaceId})`
-        } catch (uploadError: any) {
-          console.error('Upload error:', uploadError)
-          return `${args.filename} (workspace upload failed: ${uploadError.message})`
-        }
+      try {
+        console.log('Attempting to upload file to workspace:', action.workspace.id)
+        // Upload to workspace
+        await agent.uploadFile({
+          workspaceId: action.workspace.id,
+          path: args.filename,
+          file: imageBuffer,
+          skipSummarizer: true
+        })
+        console.log('File upload successful')
+        return `Image generated and saved as ${args.filename} (workspace ${action.workspace.id})`
+      } catch (uploadError: any) {
+        console.error('Upload error:', uploadError)
+        return `${args.filename} (workspace upload failed: ${uploadError.message})`
       }
-
-      return `Error uploading image to workspace ${args.workspaceId}`
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error'
       throw new Error(`Error generating image: ${errorMessage}`)
